@@ -1,0 +1,478 @@
+#Input samples
+library(ShortRead)
+fastqDir <- system.file("/Users/kalliopimariastathopoulou/Desktop/fastq1_data")
+fastqPath <- list.files("/Users/kalliopimariastathopoulou/Desktop/fastq1_data", pattern = ".fastq.gz$", full = TRUE)
+
+#FASTQC in R
+library(fastqc)
+fastqc(fq.dir="/Users/kalliopimariastathopoulou/bin/fastq1_data",qc.dir= “/Users/kalliopimariastathopoulou/bin/FastQC/fastqc_results”, threads = 4)
+list.files("/Users/kalliopimariastathopoulou/bin/FastQC/fastqc_results")
+qc<-qc_aggregate("/Users/kalliopimariastathopoulou/bin/FastQC/fastqc_results")
+#See warnings, failures, summary qc and general statistics
+library(dplyr)
+qc %>%select(sample, module, status) %>% filter(status %in% c("WARN", "FAIL")) %>%arrange(sample)
+summary(qc)
+qc_stats(qc)
+#MultiQC report
+qc_report("/Users/kalliopimariastathopoulou/bin/FastQC/fastqc_results", result.file = "~/Desktop/multi-qc-result", experiment = "Different tumors of cancer- treated and untreated samples”)
+
+#Alignment/mapping
+#Downlod the files
+rnaLocal <- paste0("~/bin", "/Rnaseq/")
+dir.create(rnaLocal, recursive = T, showWarnings = F)
+refLocal <- paste0(rnaLocal, "ref/")
+dir.create(refLocal, recursive = T, showWarnings = F)
+faFTP <- "ftp://ftp.ensembl.org/pub/release-99/fasta/homo_sapiens/dna/"
+gtfFTP <- “ftp://ftp.ensembl.org/pub/release-99/gtf/homo_sapiens/"
+faFile <- “Homo_sapiens.GRCh38.dna.chromosome.1.fa.gz"
+gtfFile <- “Homo_sapiens.GRCh38.99.chr.gtf.gz"
+download.file(paste0(faFTP,faFile), paste0(refLocal, faFile))
+download.file(paste0(gtfFTP,gtfFile), paste0(refLocal,gtfFile))
+#Create Index
+refFile <- list.files(refLocal,pattern = "fa$", full=T)
+library(Rsubread)
+buildindex(basename="my_index",reference= “~/bin/Rnaseq/ref/Homo_sapiens.GRCh38.dna.chromosome.1.fa”)
+#Alignment
+align(index=“~/bin/Rnaseq/ref/index/my_index”,readfile1=“~/bin/fastq1_data/SRR1982584.fastq.gz”,output_file=“~/bin/Rnaseq/bam_files/SRR1882584.BAM”)
+bam.files <-list.files(path ="~/bin/Rnaseq/bam_files", pattern = ".BAM$", full.names = TRUE)
+props <- propmapped(files = bam.files)
+#Alignment quality control
+qs <- qualityScores(filename="~/bin/fastq1_data/SRR1982584.fastq.gz",nreads=100)
+
+#Counting
+fc<-featureCounts(bam.files,annot.ext="~/bin/Rnaseq/ref/Homo_sapiens.GRCh38.99.chr.gtf",
+ isGTFAnnotationFile=TRUE,GTF.featureType=“exon",GTF.attrType="gene_id")
+names(fc)
+#See how many genes correspond to the samples
+dim(fc$counts) 
+
+#Quantification with Salmon
+#create index
+salmon index - i index/GRCh38_salmon -t Homo_sapiens.GRCh38.cdna.all.fa.gz
+#Quantify samples
+salmon quant –i index/GRCh38_salmon --libType A -r/Users/kalliopimariastathopoulou/bin/fastq1_data/SRR1982584.fastq.gz -o quant/SRR1982584
+
+#After quantification, create a file with information for 129 samples and see the table in R
+sampleinfo <- read.delim(“/Users/kalliopimariastathopoulou/desktop/sample_info.txt")
+View(sampleinfo)
+#See and upload the quantified files
+dirs <- list.files(“/Users/kalliopimariastathopoulou/salmon/quant")
+quant_files<list.files("/Users/kalliopimariastathopoulou/salmon/quant",pattern="quant.sf.gz",recursive = TRUE,full.names = TRUE)
+names(quant_files) <- paste0("sample", 1:129)
+all(file.exists(quant_files))
+#Review salmon's results
+library(readr)
+quants <- read_tsv(quant_files[1])
+head(quants)
+#Steps for tpm calculation
+rpk <- quants$NumReads / quants$EffectiveLength
+scale_factor <- sum(rpk) / 1e6
+tpm <- rpk / scale_factor
+
+#Check if the gtf file exists and create transcription database
+gtf_file <- “~/bin/Rnaseq/ref/Homo_sapiens.GRCh38.99.chr.gtf.gz"
+file.exists(gtf_file)
+library(GenomicFeatures)
+txdb <- makeTxDbFromGFF(gtf_file)
+#we want the gene names corresponding to each transcript in the database
+k <- keys(txdb, keytype="TXNAME")
+tx_map <- select(txdb, keys = k, columns="GENEID", keytype = "TXNAME")
+library(tximport)
+tx2gene <- tx_map 
+write.csv(tx2gene,file="tx2gene.csv",row.names = FALSE,quote=FALSE)
+txi <- tximport(quant_files,type="salmon",tx2gene = tx2gene,ignoreTxVersion = TRUE)
+names(txi)
+cts <- txi$counts
+#See if the results of the samples and genes are true and creste two more columns
+all(rownames(sampleinfo) == colnames(txi$counts))library(tidyr)
+quants <- separate(quants, Name, c("TXNAME","Number"),remove = FALSE)
+head(quants)
+#join two tables based on a common column
+library(dplyr)
+quants <- left_join(quants, tx_map, by="TXNAME")
+head(quants)
+tx2gene <- dplyr:::select(quants, Name, GENEID)
+head(tx2gene)
+#Check for missing values
+any(is.na(tx2gene$GENEID))
+tx2gene <- filter(tx2gene, !is.na(GENEID))
+library(tximport)
+txi <- tximport(quant_files,type="salmon",tx2gene = tx2gene)
+
+#Differential gene expression analysis
+library(DESeq2)
+dds <- DESeqDataSetFromTximport(txi, colData = sampleinfo, design <- ~Group)
+colData(dds)
+tpm <- txi$abundance
+write.csv(tpm, file="tpm_values.csv", quote=FALSE)
+fpm <- fpm(dds)
+write.csv(fpm, file="fpm_values.csv", quote(FALSE))
+fpkm <- fpkm(dds)
+write.csv(fpkm, file="fpkm_values.csv", quote(FALSE))
+countdata <- assay(dds)
+head(countdata)
+sum(assay(dds) [,1])
+#total numbers of reads for 129 samples
+sum(assay(dds))
+[1] 561501702
+colSums(assay(dds))
+#Filtering out the unexpressed genes
+is_expressed <- assay(dds)>=5
+head(is_expressed)
+#we will retain all genes where the total number of reads is greater than 5 and which are expressed in at least 25 samples
+keep <- rowSums(assay(dds) >=5) >=25
+table(keep)
+keep
+FALSE  TRUE 
+24339 10796 
+#ΑThe number of expressed genes is 10796.
+keep.counts <- dds[keep,]
+keep.counts
+
+class: DESeqDataSet 
+dim: 10796 129 
+
+#see the differences before and after the filtering
+dim(dds)
+[1] 35135   129
+dim(keep.counts)
+[1] 10796   129
+
+#we use 10796 genes for 129 samples
+design <- as.formula(~ Group)
+ddsObj<-DESeqDataSetFromMatrix(countData=assay(keep.counts)+1,colData=sampleinfo,design=
+design)
+ddsObj
+
+#Normalization
+ddsObj <- estimateSizeFactors(ddsObj)
+ddsObj@colData$sizeFactor
+vsd <- vst(assay(ddsObj)+1, blind=TRUE)
+cancerCol <- as.numeric(factor(sampleinfo$Cancer_type)) +1
+boxplot(vsd,xlab="", ylab="Log2 counts per million", las=2, col=cancerCol,main="Normalized Distributions")
+abline(h=median(as.matrix(vsd)), col=“blue") 
+
+#Quality control of the imported measurements
+#PCA
+library(ggfortify)
+vsd <- vst(assay(ddsObj)+1, blind=TRUE)
+pcDat <- prcomp(t(vsd))
+autoplot(pcDat) 
+autoplot(pcDat, data = sampleinfo, colour="Cancer_type",shape = "Group", size=5)
+
+#Differential gene expression analysis
+alpha <- 0.0001
+ddsObj <- nbinomWaldTest(ddsObj)
+res.DESeq2 <- results(ddsObj, alpha=alpha, pAdjustMethod="BH")
+summary (res.DESeq2)
+#adjusted p-values less than 0.0001
+sum(res.DESeq2$padj < 0.0001, na.rm=TRUE)
+[1] 4559
+#See the 4559 genes
+rownames (subset(res.DESeq2,padj< 0.0001) )
+#Retrieve the normalized counts for the genes of interest, which are 4559
+count.table.kept <- log2(normalizedCounts + epsilon)[gene.kept, ]
+dim(count.table.kept)
+[1] 4559 129
+#Gene annotation
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+res.DESeq2$symbol<-mapIds(org.Hs.eg.db,keys=row.names(res.DESeq2),column="SYMBOL",keytype="ENSEMBL",multiVals="first")
+res.DESeq2$entrez<-mapIds(org.Hs.eg.db,                   keys=row.names(res.DESeq2),column="ENTREZID",keytype="ENSEMBL",multiVals="first")
+res.DESeq2$name<-mapIds(org.Hs.eg.db,keys=row.names(res.DESeq2),column="GENENAME",keytype="ENSEMBL",multiVals="first")
+write.csv(as.data.frame(res.DESeq2), file=“results.csv")
+anno<-AnnotationDbi::select(org.Hs.eg.db,keys=rownames(subset(res.DESeq2,padj< 0.0001)),keytype = "ENSEMBL",columns=c("SYMBOL","GENENAME"))
+#Check for duplicates
+dup_ids <- anno$ENSEMBL[duplicated(anno$ENSEMBL)]
+filter(anno, ENSEMBL %in% dup_ids) %>%  arrange(ENSEMBL) %>% head
+anno<-AnnotationDbi::select(org.Hs.eg.db,keys=rownames(subset(res.DESeq2,padj< 0.0001)),columns=c("ENSEMBL","SYMBOL","GENENAME","ENTREZID"),keytype="ENSEMBL") %>% filter(!duplicated(ENSEMBL))
+results.annotated <- na.omit(data.frame(res.DESeq2))[gene.kept,]
+results.annotated
+write.csv(as.data.frame(results.annotated), file=“results.annotated1.csv”)
+
+#Volcano plot
+N <- 10
+top_genes <- results.annotated$entrez[1:N]
+if(!require(ggrepel)) install.packages(“ggrepel")
+results.annotated %>% 
+mutate(Label = ifelse(entrez %in% top_genes, symbol, "")) %>%  
+ggplot(aes(x = log2FoldChange, y = -log10(padj), label=Label)) + geom_point(alpha=0.4) + geom_text_repel(col="blue")
+
+#Functional enrichment analysis
+genes <- results.annotated$padj < 0.0001 & !is.na(results.annotated$padj)
+names(genes) <- results.annotated$symbol
+#Go terms
+library(gProfileR)
+goResults<-gprofiler(query=gene.kept,organism="hsapiens",ordered_query= F,exclude_iea =F,max_p_value=0.0001,max_set_size=0,correction_method="fdr",hier_filtering= "moderate",domain_size = “annotated")
+gprofiler_results_oe_reordered <- goResults[, c("term.id", "domain", "term.name", "p.value", "overlap.size", "term.size", "intersection")]
+gprofiler_results_oe_reordered<-gprofiler_results_oe_reordered[order(gprofiler_results_oe_reordered$p.value), ]
+gprofiler_results_oe_GOs<-gprofiler_results_oe_reordered[grep('GO:', gprofiler_results_oe_reordered$term.id), ]
+gprofiler_results_oe_GOs
+goResults <- goResults[order(goResults$p.value),]
+
+go <- goResults[goResults$overlap.size < 100,]
+geneSet1 <- unlist(strsplit(go[1,]$intersection, ‘,'))
+normalizedCounts <- DESeq2::counts(ddsObj, normalized = TRUE)
+geneSet2 <- sample(rownames(normalizedCounts), 25)
+geneSets <- list('top_GO_term' = geneSet1,'random_set' = geneSet2)
+#group comparison between tumor samples versus normal sample
+library(gage)
+gseaResults <- gage(exprs = log2(normalizedCounts+1), ref = match(rownames(df[df$Group == 'Tumor',]), colnames(normalizedCounts)), samp = match(rownames(df[df$Group == 'Normal',]), colnames(normalizedCounts)),gsets = geneSets, compare = ‘as.group')
+
+#kegg and pathview analysis
+library(pathview)
+library(gage)
+library(gageData)
+library(org.Hs.eg.db)
+kg.human <- kegg.gsets(species="human", id.type="kegg")
+kegg.sigmet.gs <- kg.human$kg.sets[kg.human$sigmet.idx]
+kegg.dise.gs <- kg.human$kg.sets[kg.human$dise.idx]
+
+data(kegg.sets.hs)
+data(sigmet.idx.hs)
+kegg.sets.hs <- kegg.sets.hs[sigmet.idx.hs]
+head(kegg.sets.hs, 3)
+
+foldchanges <- res.DESeq2$log2FoldChange
+names(foldchanges) <- res.DESeq2$entrez
+keggres <- gage(foldchanges, gsets=kegg.sets.hs, same.dir=TRUE)
+head(keggres$greater)
+head(keggres$less)
+lapply(keggres, head)
+
+#we get the 5 largest adjustable paths and process them
+pathways = data.frame(id=rownames(keggres$greater), keggres$greater)
+head(pathways)
+sel_up <- keggres$greater[, "p.val"] < 0.0001 & !is.na(keggres$greater[, "p.val"])
+path_ids_up <- rownames(keggres$greater)[sel_up]
+path_ids_up
+
+library(dplyr)
+keggrespathways <- data.frame(id=rownames(keggres$greater), keggres$greater) %>% tbl_df() %>% filter(row_number()<=3) %>% .$id %>% as.character()
+keggresids <- substr(path_ids_up, start=1, stop=8)
+keggresids
+
+#the pathview() function in the pathview package creates plots
+pathview(gene.data=foldchanges, pathway.id=keggresids, species="hsa")
+plot_pathway<-function(pid) pathview(gene.data=foldchanges, pathway.id=pid, species="hsa", new.signature=FALSE)
+detach("package:dplyr", unload=T)
+tmp<-sapply(keggresids, function(pid) pathview(gene.data=foldchanges, pathway.id=pid, species=“hsa”))
+
+#seperation of Go terms and results of the Biological process
+go.hs <- go.gsets(species="human")
+go.bp.gs <- go.hs$go.sets[go.hs$go.subs$BP]
+go.mf.gs <- go.hs$go.sets[go.hs$go.subs$MF]
+go.cc.gs <- go.hs$go.sets[go.hs$go.subs$CC]
+
+data(go.sets.hs)
+data(go.subs.hs)
+
+gobpsets = go.sets.hs[go.subs.hs$BP]
+gobpres = gage(foldchanges, gsets=gobpsets, same.dir=TRUE)
+lapply(gobpres, head)
+head(gobpres$greater)
+go_df_enriched <-data.frame(gobpres$greater)
+head(go_df_enriched)
+GO_enriched_BP <- subset(go_df_enriched, p.val < 0.0001)
+GO_enriched_BP
+
+#Machine Learning Algorithms
+#preprocessing of the data and filtering the predictor variables
+tgexp <- t(vsd)
+library(caret)
+nzv=preProcess(tgexp,method="nzv",uniqueCut = 15)
+nzv_tgexp=predict(nzv,tgexp)
+#we can choose arbitrary cutoffs for volatility. we choose to take the 1000 best predictors.
+SDs=apply(tgexp,2,sd )
+topPreds=order(SDs,decreasing = TRUE)[1:1000]
+tgexp=tgexp[,topPreds]
+#We can center the data, which removes the mean using the preProcess() function, and then we will use the predict() function with the processCenter object to process the samples.
+processCenter=preProcess(tgexp, method = c("center"))
+tgexp=predict(processCenter,tgexp)
+#we filter out the predictor variables that are highly related
+corrFilt=preProcess(tgexp, method = "corr",cutoff = 0.9)
+#The result is atable 129x1000 we use to execute the algorithms. 
+tgexp=predict(corrFilt,tgexp)
+#Calculate the missing values
+library(RANN)
+knnimputedGexp=predict(knnImpute,missing_tgexp)
+
+#data separation. First, we create a single data frame with predictors and response variables
+df1 <- as.data.frame(colData(ddsObj)["Group"])
+tgexp=merge(df1,tgexp,by="row.names")
+rownames(tgexp)=tgexp[,1]
+rownames(tgexp)
+tgexp=tgexp[,-1]
+set.seed(3031)
+intrain <- createDataPartition(y = tgexp[,1], p= 0.7)[[1]]
+training <- tgexp[intrain,]
+testing <- tgexp[-intrain,]
+#check the training and testing sets
+dim(training)
+[1]   91 1001
+dim(testing)
+[1]   38 1001
+ 
+prop.table(table(training$Group))
+prop.table(table(testing$Group))
+
+#Random Forest algorithm
+> set.seed(17)
+rfFit <- train(Group~.,  data = training,method ="ranger",trControl=Control, importance="permutation", 
+# calculate importance, tuneGrid = data.frame(mtry=100, min.node.size = 1,splitrule="gini"))
+rfFit$finalModel$prediction.error
+[1] 0.04395604
+varImp(rfFit)
+plot(varImp(rfFit),top=10, main="RF - Variable Importance")
+  
+pred.train.rf <- predict(rfFit, training, type = "raw")
+summary(pred.train.rf)
+#result
+Normal  Tumor 
+    15     76
+ 
+confusionMatrix(training$Group,pred.train.rf)
+#result
+Confusion Matrix and Statistics
+ 
+          Reference
+Prediction Normal Tumor
+    Normal     15     0
+    Tumor       0    76
+                                     
+               Accuracy : 1          
+                 95% CI : (0.9603, 1)
+    No Information Rate : 0.8352     
+    P-Value [Acc > NIR] : 7.608e-08  
+                                     
+                  Kappa : 1          
+                                     
+ Mcnemar's Test P-Value : NA         
+                                     
+            Sensitivity : 1.0000     
+            Specificity : 1.0000     
+         Pos Pred Value : 1.0000     
+         Neg Pred Value : 1.0000     
+             Prevalence : 0.1648     
+         Detection Rate : 0.1648     
+   Detection Prevalence : 0.1648     
+      Balanced Accuracy : 1.0000     
+                                     
+       'Positive' Class : Normal     
+                                     
+pred.test.rf <- predict(rfFit, testing, type = "raw")
+summary(pred.test.rf)
+#result
+Normal  Tumor 
+     12     26
+ 
+confusionMatrix(pred.test.rf, testing$Group)
+ #result
+Confusion Matrix and Statistics
+ 
+          Reference
+Prediction Normal Tumor
+    Normal      6     6
+    Tumor       0    26
+                                          
+               Accuracy : 0.8421          
+                 95% CI : (0.6875, 0.9398)
+    No Information Rate : 0.8421          
+    P-Value [Acc > NIR] : 0.60670         
+                                          
+                  Kappa : 0.5778          
+                                          
+ Mcnemar's Test P-Value : 0.04123         
+                                          
+            Sensitivity : 1.0000          
+            Specificity : 0.8125          
+         Pos Pred Value : 0.5000          
+         Neg Pred Value : 1.0000          
+             Prevalence : 0.1579          
+         Detection Rate : 0.1579          
+   Detection Prevalence : 0.3158          
+      Balanced Accuracy : 0.9062          
+                                          
+       'Positive' Class : Normal          
+
+#Gradient Boosting algorithm
+library(xgboost)
+set.seed(17)
+Control <- trainControl(method = "cv",number = 5)
+xgbModel1<-train(Group~.,data=training,method="xgbTree",trControl=Control,tuneGrid =data.frame(nrounds=200,eta=c(0.05,0.1,0.3),max_depth=4,gamma=0,colsample_bytree=1,subsample=0.5,min_child_weight=1))
+varImp(xgbModel1)
+ 
+plot(varImp(xgbModel1),main="XG Boost - Variable Importance",top=10)
+  
+xgbModel1$bestTune
+  nrounds max_depth  eta gamma colsample_bytree min_child_weight subsample
+1     200         4 0.05     0                1                1       0.5
+ 
+pred.train.xgb <- predict(xgbModel1, data =training, type="raw")
+summary(pred.train.xgb)
+Normal  Tumor 
+    16     75
+ 
+confusionMatrix(training$Group,pred.train.xgb)
+#result 
+Confusion Matrix and Statistics
+ 
+          Reference
+Prediction Normal Tumor
+    Normal     15     0
+    Tumor       1    75
+                                          
+               Accuracy : 0.989           
+                 95% CI : (0.9403, 0.9997)
+    No Information Rate : 0.8242          
+    P-Value [Acc > NIR] : 4.653e-07       
+                                          
+                  Kappa : 0.9611          
+                                          
+ Mcnemar's Test P-Value : 1               
+                                          
+            Sensitivity : 0.9375          
+            Specificity : 1.0000          
+         Pos Pred Value : 1.0000          
+         Neg Pred Value : 0.9868          
+             Prevalence : 0.1758          
+         Detection Rate : 0.1648          
+   Detection Prevalence : 0.1648          
+      Balanced Accuracy : 0.9688          
+                                          
+       'Positive' Class : Normal          
+                                                                              
+pred.test.xgb <- predict(xgbModel1, testing, type = "raw")
+summary(pred.test.xgb)
+Normal  Tumor 
+     11     27 
+ 
+confusionMatrix(pred.test.xgb, testing$Group)
+#result
+Confusion Matrix and Statistics
+ 
+          Reference
+Prediction Normal Tumor
+    Normal      6     5
+    Tumor       0    27
+                                          
+               Accuracy : 0.8684          
+                 95% CI : (0.7191, 0.9559)
+    No Information Rate : 0.8421          
+    P-Value [Acc > NIR] : 0.43174         
+                                          
+                  Kappa : 0.6304          
+                                          
+ Mcnemar's Test P-Value : 0.07364         
+                                          
+            Sensitivity : 1.0000          
+            Specificity : 0.8438          
+         Pos Pred Value : 0.5455          
+         Neg Pred Value : 1.0000          
+             Prevalence : 0.1579          
+         Detection Rate : 0.1579          
+   Detection Prevalence : 0.2895          
+      Balanced Accuracy : 0.9219          
+                                          
+       'Positive' Class : Normal      
+
