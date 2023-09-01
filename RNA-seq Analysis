@@ -295,6 +295,7 @@ corrFilt=preProcess(tgexp, method = "corr",cutoff = 0.9)
 tgexp=predict(corrFilt,tgexp)
 #Calculate the missing values
 library(RANN)
+knnImpute=preProcess(missing_tgexp,method="knnImpute")
 knnimputedGexp=predict(knnImpute,missing_tgexp)
 
 #data separation. First, we create a single data frame with predictors and response variables
